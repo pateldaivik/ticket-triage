@@ -1,0 +1,41 @@
+[project]
+name = "ticket-triage"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Daivik Patel", email = "work.daivik@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=3.42.1",
+    "pydantic>=2.14.2",
+    "pydantic-settings>=2.16.2",
+    "typer>=0.27.3",
+]
+
+[project.scripts]
+ticket-triage = "ticket_triage.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.11.29,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.7.0",
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E","F","I","UP","B","SIM"]
+
+[tool.pytest.ini_options]
+testpaths=["tests"]
+markers=["live: calls the real OpenAI API"]
+addopts = "-m 'not live'"
