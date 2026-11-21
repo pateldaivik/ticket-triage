@@ -1,7 +1,7 @@
-from pydantic import BaseSetttings, SettingsConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class Settings(BaseSetttings):
+class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     openai_api_key: str
     model: str = "gpt-5.4-nano"
