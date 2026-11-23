@@ -1,13 +1,14 @@
+import asyncio
 import logging
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal
 
 import httpx
 import openai
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 from pydantic import BaseModel, Field
 
 from ticket_triage.config import Settings
@@ -110,6 +111,15 @@ def is_retryable(exc: Exception) -> bool:
     return isinstance(exc, openai.APIStatusError) and exc.status_code >= 500
 
 
+def retry_delay(exc: Exception, attempt: int) -> float:
+    delay = backoff_delay(attempt)
+    if isinstance(exc, openai.RateLimitError):
+        retry_after = exc.response.headers.get("retry-after")
+        if retry_after:
+            delay = float(retry_after)
+    return delay
+
+
 def with_retry[T](fn: Callable[[], T], max_attempts: int = MAX_ATTEMPTS, sleep=time.sleep) -> T:
     for attempt in range(max_attempts):
         try:
@@ -117,11 +127,7 @@ def with_retry[T](fn: Callable[[], T], max_attempts: int = MAX_ATTEMPTS, sleep=t
         except Exception as exc:
             if not is_retryable(exc) or attempt == max_attempts - 1:
                 raise
-            delay = backoff_delay(attempt)
-            if isinstance(exc, openai.RateLimitError):
-                retry_after = exc.response.headers.get("retry-after")
-                if retry_after:
-                    delay = float(retry_after)
+            delay = retry_delay(exc, attempt=attempt)
             log.warning(
                 "llm_retry attempt=%d/%d err=%s sleep=%.2fs",
                 attempt + 1,
@@ -132,6 +138,32 @@ def with_retry[T](fn: Callable[[], T], max_attempts: int = MAX_ATTEMPTS, sleep=t
             sleep(delay)
 
     raise AssertionError("unreachable")
+
+
+async def with_retry_async[T](
+    fn: Callable[[], Awaitable[T]], max_attempts: int = MAX_ATTEMPTS, sleep=asyncio.sleep
+) -> T:
+    """Same policy as with_retry, but awaits fn() and sleeps without blocking the event loop."""
+    for attempt in range(max_attempts):
+        try:
+            return await fn()
+        except Exception as exc:
+            if not is_retryable(exc) or attempt == max_attempts - 1:
+                raise
+            delay = retry_delay(exc, attempt=attempt)
+            log.warning(
+                "llm_retry_async attempt=%d err=%s sleep=%.2fs",
+                attempt + 1,
+                type(exc).__name__,
+                delay,
+            )
+            await sleep(delay)
+
+    raise AssertionError("unreachable")
+
+
+def format_ticket(subject: str | None, body: str) -> str:
+    return f"Subject: {subject or '(no subject)'}\n\nBody:\n{body}"
 
 
 def classify_ticket(subject: str | None, body: str) -> CallResult:
@@ -145,7 +177,7 @@ def classify_ticket(subject: str | None, body: str) -> CallResult:
         timeout=httpx.Timeout(settings.request_timeout_s, connect=5.0),
     )
 
-    ticket_text = f"Subject: {subject or '(no subject)'}\n\nBody:\n{body}"
+    ticket_text = format_ticket(subject=subject, body=body)
 
     start = time.perf_counter()
     response = with_retry(
@@ -157,7 +189,37 @@ def classify_ticket(subject: str | None, body: str) -> CallResult:
         )
     )
     latency_s = time.perf_counter() - start
+    return _to_result(response, settings, latency_s)
 
+
+def make_async_client(settings: Settings) -> AsyncOpenAI:
+    """One client per run: it holds the connection pool that concurrent calls share."""
+    return AsyncOpenAI(
+        api_key=settings.openai_api_key,
+        max_retries=0,
+        timeout=httpx.Timeout(settings.request_timeout_s, connect=5.0),
+    )
+
+
+async def classify_ticket_async(
+    client: AsyncOpenAI, settings: Settings, subject: str | None, body: str
+) -> CallResult:
+    """Async twin of classify_ticket. `await` hands control back to the event loop while waiting."""
+    ticket_text = format_ticket(subject=subject, body=body)
+    start = time.perf_counter()
+    response = await with_retry_async(
+        lambda: client.responses.parse(
+            model=settings.model,
+            instructions=SYSTEM_PROMPT,
+            input=ticket_text,
+            text_format=TicketLabel,
+        )
+    )
+    return _to_result(response, settings, time.perf_counter() - start)
+
+
+def _to_result(response, settings: Settings, latency_s: float) -> CallResult:
+    """Shared by sync and async: validate the parsed output and compute cost."""
     label = response.output_parsed
     if label is None:
         raise RuntimeError(
@@ -175,3 +237,20 @@ def classify_ticket(subject: str | None, body: str) -> CallResult:
     cost = cost_usd(in_tok, out_tok, settings.price_input_per_1m, settings.price_output_per_1m)
     log.info("llm_call in=%d out=%d cost=$%.6f latency=%.2fs", in_tok, out_tok, cost, latency_s)
     return CallResult(label, in_tok, out_tok, cost, latency_s)
+
+
+async def classify_many(
+    client: AsyncOpenAI,
+    settings: Settings,
+    tickets: list[tuple[str | None, str]],
+    max_concurrency: int = 5,
+) -> list[CallResult]:
+    """Classify all tickets concurrently, but never more than max_concurrency in flight."""
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def one(subject: str | None, body: str) -> CallResult:
+        async with sem:  # waits here if max_concurrency calls are already running
+            return await classify_ticket_async(client, settings, subject, body)
+
+    # gather keeps input order, so results[i] matches tickets[i]
+    return await asyncio.gather(*(one(s, b) for s, b in tickets))
