@@ -12,6 +12,7 @@ from openai import AsyncOpenAI, OpenAI
 from pydantic import BaseModel, Field
 
 from ticket_triage.config import Settings
+from ticket_triage.core.rate_limit import TokenBucket
 
 log = logging.getLogger(__name__)
 
@@ -244,12 +245,15 @@ async def classify_many(
     settings: Settings,
     tickets: list[tuple[str | None, str]],
     max_concurrency: int = 5,
+    bucket: TokenBucket | None = None,
 ) -> list[CallResult]:
-    """Classify all tickets concurrently, but never more than max_concurrency in flight."""
+    """Classify concurrently: the semaphore caps calls in flight, the bucket caps calls/minute."""
     sem = asyncio.Semaphore(max_concurrency)
 
     async def one(subject: str | None, body: str) -> CallResult:
         async with sem:  # waits here if max_concurrency calls are already running
+            if bucket:
+                await bucket.acquire()  # waits here if we'd exceed the RPM budget
             return await classify_ticket_async(client, settings, subject, body)
 
     # gather keeps input order, so results[i] matches tickets[i]

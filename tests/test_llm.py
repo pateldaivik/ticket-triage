@@ -107,3 +107,16 @@ def test_classify_many_caps_concurrency(monkeypatch):
     results = asyncio.run(llm.classify_many(None, None, tickets, max_concurrency=3))
     assert results == [f"t{i}" for i in range(10)]  # order preserved
     assert peak == 3
+
+
+def test_classify_many_takes_one_token_per_ticket(monkeypatch):
+    import ticket_triage.core.llm as llm
+    from ticket_triage.core.rate_limit import TokenBucket
+
+    async def fake_classify(client, settings, subject, body):
+        return body
+
+    monkeypatch.setattr(llm, "classify_ticket_async", fake_classify)
+    bucket = TokenBucket(capacity=10, refill_per_s=0.001)  # ~no refill during the test
+    asyncio.run(llm.classify_many(None, None, [(None, "a")] * 4, bucket=bucket))
+    assert round(bucket.tokens) == 6
